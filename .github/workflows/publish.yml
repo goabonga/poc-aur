@@ -21,6 +21,15 @@ on:
         required: true
         type: string
 
+# poc-app dispatches every bumped component at roughly the same time, and
+# each run commits to the same main branch ("Commit the updated recipe").
+# Without this, two concurrent runs race: whichever pushes second gets a
+# non-fast-forward rejection, since it checked out main before the first
+# run's commit landed - confirmed for real (greeter's run pushed fine,
+# pinger's failed seconds later on the same branch).
+concurrency:
+  group: publish-${{ github.repository }}
+
 jobs:
   publish:
     name: publish (${{ inputs.component }} ${{ inputs.version }})
