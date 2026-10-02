@@ -54,17 +54,27 @@ jobs:
             "https://api.github.com/repos/goabonga/poc-app/tarball/${{ inputs.component }}-v${{ inputs.version }}"
 
       - name: Recompute checksums, regenerate .SRCINFO and build for real
+        # makepkg refuses to run as root, hence the throwaway builder user -
+        # but chown -R builder:builder on the bind-mounted /pkg leaves its
+        # files owned by the container's UID on the HOST side too, which
+        # doesn't match the runner user and breaks every later host-side
+        # step that touches packages/<component>/ (confirmed for real: the
+        # cleanup rm below failed with "Permission denied" the first time).
+        # Cleaning up and chowning back to the original owner, as root,
+        # before the container exits, fixes both that and the commit step.
         run: |
           docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
             set -euo pipefail
+            orig_owner=$(stat -c "%u:%g" /pkg)
             pacman -Sy --noconfirm --needed base-devel pacman-contrib go >/dev/null
             useradd -m builder
             chown -R builder:builder /pkg
             runuser -u builder -- updpkgsums
             runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
             runuser -u builder -- makepkg -s --noconfirm
+            rm -f /pkg/poc-app-*.tar.gz
+            chown -R "$orig_owner" /pkg
           '
-          rm -f packages/${{ inputs.component }}/poc-app-${{ inputs.version }}.tar.gz
 
       - name: Publish the built package as a poc-aur release
         # A stable fallback download URL for the callback below,
