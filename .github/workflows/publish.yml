@@ -57,8 +57,20 @@ jobs:
           set -euo pipefail
           tag="${{ inputs.component }}-v${{ inputs.version }}"
           pkgfile=$(ls packages/${{ inputs.component }}/*.pkg.tar.zst)
+          # Pull this release's actual notes out of multicz's own
+          # per-component CHANGELOG.md - makepkg leaves the extracted
+          # upstream source under src/ after a build.
+          changelog_md="packages/${{ inputs.component }}/src/poc-app-${{ inputs.component }}-v${{ inputs.version }}/cmd/${{ inputs.component }}/CHANGELOG.md"
+          notes=$(awk -v ver="${{ inputs.version }}" '
+            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture && /^- /    { print }
+          ' "$changelog_md")
+          if [ -z "$notes" ]; then
+            notes="New upstream release: poc-app $tag."
+          fi
           gh release create "$tag" "$pkgfile" --title "$tag" \
-            --notes "Arch package built from poc-app@$tag." \
+            --notes "$notes" \
             --repo "${{ github.repository }}"
           url=$(gh release view "$tag" --repo "${{ github.repository }}" \
             --json assets -q ".assets[0].browser_download_url")
