@@ -35,36 +35,31 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${{ inputs.version }}/" packages/${{ inputs.component }}/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" packages/${{ inputs.component }}/PKGBUILD
 
-      - name: Wait for poc-app's release archive
-        # codeload.github.com can 404 for a few seconds right after a tag is
-        # pushed - the archive isn't generated synchronously with the push.
-        # This is normally dispatched within seconds of that push by
-        # poc-app's own release workflow, so makepkg's own fetch (which
-        # doesn't retry on 404) needs the URL to already be live first.
+      - name: Fetch poc-app's release archive
+        # poc-app is a private repo, and makepkg's DLAGENTS curl call has no
+        # way to take a bearer token (confirmed for real: it doesn't pass
+        # -n/--netrc, so a .netrc is silently ignored). Pre-placing the file
+        # under the name source=() expects is makepkg's own documented way
+        # to skip its own fetch - `updpkgsums`/`makepkg` both just find it.
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
-          url="https://github.com/goabonga/poc-app/archive/refs/tags/${{ inputs.component }}-v${{ inputs.version }}.tar.gz"
-          for attempt in $(seq 1 10); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' -L "$url")
-            [ "$code" = "200" ] && break
-            if [ "$attempt" -eq 10 ]; then
-              echo "$url still not fetchable after 10 attempts (last: $code)" >&2
-              exit 1
-            fi
-            echo "not available yet ($code, attempt $attempt/10), retrying in 3s"
-            sleep 3
-          done
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -o "packages/${{ inputs.component }}/poc-app-${{ inputs.version }}.tar.gz" \
+            "https://github.com/goabonga/poc-app/archive/refs/tags/${{ inputs.component }}-v${{ inputs.version }}.tar.gz"
 
       - name: Recompute checksums, regenerate .SRCINFO and build for real
         run: |
           docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
             set -euo pipefail
-            pacman -Sy --noconfirm --needed base-devel pacman-contrib >/dev/null
+            pacman -Sy --noconfirm --needed base-devel pacman-contrib go >/dev/null
             useradd -m builder
             chown -R builder:builder /pkg
             runuser -u builder -- updpkgsums
             runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
             runuser -u builder -- makepkg -s --noconfirm
           '
+          rm -f packages/${{ inputs.component }}/poc-app-${{ inputs.version }}.tar.gz
 
       - name: Publish the built package as a poc-aur release
         # A stable fallback download URL for the callback below,

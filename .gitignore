@@ -3,3 +3,7 @@
 /packages/*/src/
 /packages/*/*.pkg.tar.*
 /packages/*/*.log
+
+# pre-fetched source, placed here so makepkg skips its own (unauthenticated)
+# download of poc-app's private-repo archive
+/packages/*/poc-app-*.tar.gz
