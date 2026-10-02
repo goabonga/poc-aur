@@ -1,14 +1,10 @@
 name: publish
 
-# Placeholder publish pipeline: reports a fake download URL back to poc-app
-# instead of actually building. The real build (packages/<component>/PKGBUILD)
-# works - verified end-to-end for real against the actual private poc-app
-# repo - but the environment quirks around it (Docker UID/chown, the
-# makepkg -debug package, fine-grained PAT auth) made the cross-repo
-# dispatch + callback loop itself slow to validate. This isolates that loop
-# from the build while it's being exercised on its own; swap the "Fake
-# publish" step back for the real build steps (see git history on this
-# file) once the loop is solid.
+# Bumps one component's PKGBUILD to a released poc-app version, builds it
+# for real against the actual GitHub release tarball, publishes the result
+# as a poc-aur release (a stable URL regardless of AUR configuration), and
+# - when an AUR SSH deploy key is configured - pushes PKGBUILD + .SRCINFO to
+# that package's AUR git repository. Reports back to poc-app either way.
 # Can be run by hand, but is normally dispatched by poc-app's release
 # workflow right after it tags a release.
 
@@ -29,16 +25,137 @@ jobs:
   publish:
     name: publish (${{ inputs.component }} ${{ inputs.version }})
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - name: Fake publish
-        id: fake
+      - uses: actions/checkout@v7
+
+      - name: Bump pkgver
         run: |
-          echo "url=https://example.invalid/poc-aur/poc-${{ inputs.component }}-${{ inputs.version }}-1-x86_64.pkg.tar.zst" >> "$GITHUB_OUTPUT"
+          sed -i "s/^pkgver=.*/pkgver=${{ inputs.version }}/" packages/${{ inputs.component }}/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packages/${{ inputs.component }}/PKGBUILD
+
+      - name: Fetch poc-app's release archive
+        # poc-app is a private repo. makepkg's DLAGENTS curl call has no way
+        # to take a bearer token (confirmed for real: it doesn't pass
+        # -n/--netrc, so a .netrc is silently ignored) - pre-placing the file
+        # under the name source=() expects is makepkg's own documented way
+        # to skip its own fetch. The plain codeload archive URL also 404s
+        # with a fine-grained PAT even with correct Contents:read scope
+        # (confirmed against the user's actual PAT); the REST API tarball
+        # endpoint works, since it 302s to a pre-signed codeload URL with
+        # the token in the query string rather than needing the
+        # Authorization header to survive the redirect.
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          curl -fsSL -L -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -o "packages/${{ inputs.component }}/poc-app-${{ inputs.version }}.tar.gz" \
+            "https://api.github.com/repos/goabonga/poc-app/tarball/${{ inputs.component }}-v${{ inputs.version }}"
+
+      - name: Recompute checksums, regenerate .SRCINFO and build for real
+        # makepkg refuses to run as root, hence the throwaway builder user -
+        # but chown -R builder:builder on the bind-mounted /pkg leaves its
+        # files owned by the container's UID on the HOST side too, which
+        # doesn't match the runner user and breaks every later host-side
+        # step that touches packages/<component>/ (confirmed for real: the
+        # cleanup rm below failed with "Permission denied" the first time).
+        # Cleaning up and chowning back to the original owner, as root,
+        # before the container exits, fixes both that and the commit step.
+        run: |
+          docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
+            set -euo pipefail
+            orig_owner=$(stat -c "%u:%g" /pkg)
+            pacman -Sy --noconfirm --needed base-devel pacman-contrib go >/dev/null
+            useradd -m builder
+            chown -R builder:builder /pkg
+            runuser -u builder -- updpkgsums
+            runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
+            runuser -u builder -- makepkg -s --noconfirm
+            rm -f /pkg/poc-app-*.tar.gz
+            chown -R "$orig_owner" /pkg
+          '
+
+      - name: Publish the built package as a poc-aur release
+        # A stable fallback download URL for the callback below,
+        # independent of whether an AUR deploy key is configured.
+        id: github_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.component }}-v${{ inputs.version }}"
+          # makepkg also builds a separate -debug package by default; the
+          # glob below used to match both and hand gh release create a
+          # single garbled multi-line argument (confirmed for real).
+          pkgfile=$(ls packages/${{ inputs.component }}/*.pkg.tar.zst | grep -v -- -debug-)
+          # Pull this release's actual notes out of multicz's own
+          # per-component CHANGELOG.md - makepkg leaves the extracted
+          # upstream source under src/ after a build. Its directory name
+          # isn't fixed (see the PKGBUILD's build() comment), so glob it.
+          changelog_md=$(ls packages/${{ inputs.component }}/src/*poc-app*/cmd/${{ inputs.component }}/CHANGELOG.md)
+          notes=$(awk -v ver="${{ inputs.version }}" '
+            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+            capture && /^## \[/ { exit }
+            capture && /^- /    { print }
+          ' "$changelog_md")
+          if [ -z "$notes" ]; then
+            notes="New upstream release: poc-app $tag."
+          fi
+          gh release create "$tag" "$pkgfile" --title "$tag" \
+            --notes "$notes" \
+            --repo "${{ github.repository }}"
+          # `gh`'s own JSON schema names this field "url", not the raw REST
+          # API's "browser_download_url" - confirmed for real: the wrong
+          # name silently resolved to empty rather than erroring.
+          url=$(gh release view "$tag" --repo "${{ github.repository }}" \
+            --json assets -q ".assets[0].url")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Commit the updated recipe
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/${{ inputs.component }}/PKGBUILD packages/${{ inputs.component }}/.SRCINFO
+          git commit -m "chore(${{ inputs.component }}): bump to ${{ inputs.version }}" || echo "nothing to commit"
+          git push
+
+      - name: Check AUR deploy key availability
+        id: aur
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -n "$AUR_SSH_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::secrets.AUR_SSH_KEY unset; built and committed locally only, not pushed to the AUR"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to the AUR
+        if: steps.aur.outputs.available == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          install -m 600 /dev/stdin ~/.aur_ssh_key <<<"$AUR_SSH_KEY"
+          export GIT_SSH_COMMAND="ssh -i ~/.aur_ssh_key -o StrictHostKeyChecking=accept-new"
+          repo="$(mktemp -d)"
+          git clone "ssh://aur@aur.archlinux.org/poc-${{ inputs.component }}.git" "$repo"
+          cp packages/${{ inputs.component }}/PKGBUILD packages/${{ inputs.component }}/.SRCINFO "$repo/"
+          cd "$repo"
+          git config user.name "Chris"
+          git config user.email "goabonga@pm.me"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && { echo "nothing to push"; exit 0; }
+          git commit -m "${{ inputs.component }}-v${{ inputs.version }}"
+          git push origin HEAD:master
 
       - name: Report back to poc-app
         # CROSS_REPO_TOKEN is the same fine-grained PAT poc-app uses to
         # trigger this workflow, with Contents (read/write) on poc-app too
-        # so it can fire this repository_dispatch.
+        # so it can fire this repository_dispatch. Links the real AUR page
+        # once pushed there; falls back to this run's poc-aur release
+        # otherwise.
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
@@ -46,9 +163,14 @@ jobs:
             echo "::warning::secrets.CROSS_REPO_TOKEN unset; poc-app was not notified"
             exit 0
           fi
+          if [ "${{ steps.aur.outputs.available }}" = "true" ]; then
+            url="https://aur.archlinux.org/packages/poc-${{ inputs.component }}"
+          else
+            url="${{ steps.github_release.outputs.url }}"
+          fi
           gh api repos/goabonga/poc-app/dispatches \
             -f event_type=package-published \
             -f "client_payload[component]=${{ inputs.component }}" \
             -f "client_payload[version]=${{ inputs.version }}" \
             -f "client_payload[kind]=aur" \
-            -f "client_payload[url]=${{ steps.fake.outputs.url }}"
+            -f "client_payload[url]=$url"
