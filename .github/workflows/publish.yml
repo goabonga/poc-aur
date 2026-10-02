@@ -1,10 +1,12 @@
 name: publish
 
 # Bumps one component's PKGBUILD to a released poc-app version, builds it
-# for real against the actual GitHub release tarball, and - when an AUR SSH
-# deploy key is configured - pushes PKGBUILD + .SRCINFO to that package's
-# AUR git repository. Designed to be called either by hand or by poc-app's
-# release workflow once the cross-repo dispatch is wired up.
+# for real against the actual GitHub release tarball, publishes the result
+# as a poc-aur release (a stable URL regardless of AUR configuration), and
+# - when an AUR SSH deploy key is configured - pushes PKGBUILD + .SRCINFO to
+# that package's AUR git repository. Reports back to poc-app either way.
+# Can be run by hand, but is normally dispatched by poc-app's release
+# workflow right after it tags a release.
 
 on:
   workflow_dispatch:
@@ -45,6 +47,23 @@ jobs:
             runuser -u builder -- makepkg -s --noconfirm
           '
 
+      - name: Publish the built package as a poc-aur release
+        # A stable fallback download URL for the callback below,
+        # independent of whether an AUR deploy key is configured.
+        id: github_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.component }}-v${{ inputs.version }}"
+          pkgfile=$(ls packages/${{ inputs.component }}/*.pkg.tar.zst)
+          gh release create "$tag" "$pkgfile" --title "$tag" \
+            --notes "Arch package built from poc-app@$tag." \
+            --repo "${{ github.repository }}"
+          url=$(gh release view "$tag" --repo "${{ github.repository }}" \
+            --json assets -q ".assets[0].browser_download_url")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
       - name: Commit the updated recipe
         run: |
           git config user.name "github-actions[bot]"
@@ -82,3 +101,28 @@ jobs:
           git diff --cached --quiet && { echo "nothing to push"; exit 0; }
           git commit -m "${{ inputs.component }}-v${{ inputs.version }}"
           git push origin HEAD:master
+
+      - name: Report back to poc-app
+        # CROSS_REPO_TOKEN is the same fine-grained PAT poc-app uses to
+        # trigger this workflow, with Contents (read/write) on poc-app too
+        # so it can fire this repository_dispatch. Links the real AUR page
+        # once pushed there; falls back to this run's poc-aur release
+        # otherwise.
+        env:
+          GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::secrets.CROSS_REPO_TOKEN unset; poc-app was not notified"
+            exit 0
+          fi
+          if [ "${{ steps.aur.outputs.available }}" = "true" ]; then
+            url="https://aur.archlinux.org/packages/poc-${{ inputs.component }}"
+          else
+            url="${{ steps.github_release.outputs.url }}"
+          fi
+          gh api repos/goabonga/poc-app/dispatches \
+            -f event_type=package-published \
+            -f "client_payload[component]=${{ inputs.component }}" \
+            -f "client_payload[version]=${{ inputs.version }}" \
+            -f "client_payload[kind]=aur" \
+            -f "client_payload[url]=$url"
