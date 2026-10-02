@@ -35,6 +35,25 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${{ inputs.version }}/" packages/${{ inputs.component }}/PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" packages/${{ inputs.component }}/PKGBUILD
 
+      - name: Wait for poc-app's release archive
+        # codeload.github.com can 404 for a few seconds right after a tag is
+        # pushed - the archive isn't generated synchronously with the push.
+        # This is normally dispatched within seconds of that push by
+        # poc-app's own release workflow, so makepkg's own fetch (which
+        # doesn't retry on 404) needs the URL to already be live first.
+        run: |
+          url="https://github.com/goabonga/poc-app/archive/refs/tags/${{ inputs.component }}-v${{ inputs.version }}.tar.gz"
+          for attempt in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -L "$url")
+            [ "$code" = "200" ] && break
+            if [ "$attempt" -eq 10 ]; then
+              echo "$url still not fetchable after 10 attempts (last: $code)" >&2
+              exit 1
+            fi
+            echo "not available yet ($code, attempt $attempt/10), retrying in 3s"
+            sleep 3
+          done
+
       - name: Recompute checksums, regenerate .SRCINFO and build for real
         run: |
           docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
