@@ -1,0 +1,84 @@
+name: publish
+
+# Bumps one component's PKGBUILD to a released poc-app version, builds it
+# for real against the actual GitHub release tarball, and - when an AUR SSH
+# deploy key is configured - pushes PKGBUILD + .SRCINFO to that package's
+# AUR git repository. Designed to be called either by hand or by poc-app's
+# release workflow once the cross-repo dispatch is wired up.
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: poc-app component to package
+        required: true
+        type: choice
+        options: [greeter, pinger]
+      version:
+        description: upstream version (must already be tagged "<component>-v<version>" on poc-app)
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: publish (${{ inputs.component }} ${{ inputs.version }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bump pkgver
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ inputs.version }}/" packages/${{ inputs.component }}/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packages/${{ inputs.component }}/PKGBUILD
+
+      - name: Recompute checksums, regenerate .SRCINFO and build for real
+        run: |
+          docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
+            set -euo pipefail
+            pacman -Sy --noconfirm --needed base-devel pacman-contrib >/dev/null
+            useradd -m builder
+            chown -R builder:builder /pkg
+            runuser -u builder -- updpkgsums
+            runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
+            runuser -u builder -- makepkg -s --noconfirm
+          '
+
+      - name: Commit the updated recipe
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/${{ inputs.component }}/PKGBUILD packages/${{ inputs.component }}/.SRCINFO
+          git commit -m "chore(${{ inputs.component }}): bump to ${{ inputs.version }}" || echo "nothing to commit"
+          git push
+
+      - name: Check AUR deploy key availability
+        id: aur
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -n "$AUR_SSH_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::secrets.AUR_SSH_KEY unset; built and committed locally only, not pushed to the AUR"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to the AUR
+        if: steps.aur.outputs.available == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          install -m 600 /dev/stdin ~/.aur_ssh_key <<<"$AUR_SSH_KEY"
+          export GIT_SSH_COMMAND="ssh -i ~/.aur_ssh_key -o StrictHostKeyChecking=accept-new"
+          repo="$(mktemp -d)"
+          git clone "ssh://aur@aur.archlinux.org/poc-${{ inputs.component }}.git" "$repo"
+          cp packages/${{ inputs.component }}/PKGBUILD packages/${{ inputs.component }}/.SRCINFO "$repo/"
+          cd "$repo"
+          git config user.name "Chris"
+          git config user.email "goabonga@pm.me"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && { echo "nothing to push"; exit 0; }
+          git commit -m "${{ inputs.component }}-v${{ inputs.version }}"
+          git push origin HEAD:master

@@ -1,0 +1,27 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  srcinfo:
+    name: srcinfo (${{ matrix.component }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        component: [greeter, pinger]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate .SRCINFO and lint with namcap
+        run: |
+          docker run --rm -v "$PWD/packages/${{ matrix.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
+            set -euo pipefail
+            pacman -Sy --noconfirm --needed base-devel namcap >/dev/null
+            useradd -m builder
+            chown -R builder:builder /pkg
+            runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
+            namcap PKGBUILD
+            rm /pkg/.SRCINFO
+          '
