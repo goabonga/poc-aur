@@ -1,10 +1,11 @@
 name: publish
 
-# Bumps one component's PKGBUILD to a released poc-app version, builds it
-# for real against the actual GitHub release tarball, publishes the result
-# as a poc-aur release (a stable URL regardless of AUR configuration), and
-# - when an AUR SSH deploy key is configured - pushes PKGBUILD + .SRCINFO to
-# that package's AUR git repository. Reports back to poc-app either way.
+# Bumps one component's PKGBUILD to a released poc-app version, recomputes its
+# checksums and .SRCINFO against the actual release tarball, commits the recipe
+# and - when an AUR SSH deploy key is configured - pushes PKGBUILD + .SRCINFO to
+# that package's AUR git repository. Nothing is built here: the AUR hosts the
+# recipe and users build from it. The archive of the AUR repository is then
+# sent to poc-app, which attaches it to its release.
 # Can be run by hand, but is normally dispatched by poc-app's release
 # workflow right after it tags a release.
 
@@ -62,7 +63,7 @@ jobs:
             -o "packages/${{ inputs.component }}/poc-app-${{ inputs.version }}.tar.gz" \
             "https://api.github.com/repos/goabonga/poc-app/tarball/${{ inputs.component }}-v${{ inputs.version }}"
 
-      - name: Recompute checksums, regenerate .SRCINFO and build for real
+      - name: Recompute checksums and regenerate .SRCINFO
         # makepkg refuses to run as root, hence the throwaway builder user -
         # but chown -R builder:builder on the bind-mounted /pkg leaves its
         # files owned by the container's UID on the HOST side too, which
@@ -71,55 +72,19 @@ jobs:
         # cleanup rm below failed with "Permission denied" the first time).
         # Cleaning up and chowning back to the original owner, as root,
         # before the container exits, fixes both that and the commit step.
+        # The package is not built: the recipe is what the AUR holds.
         run: |
           docker run --rm -v "$PWD/packages/${{ inputs.component }}":/pkg -w /pkg archlinux:base-devel bash -c '
             set -euo pipefail
             orig_owner=$(stat -c "%u:%g" /pkg)
-            pacman -Sy --noconfirm --needed base-devel pacman-contrib go >/dev/null
+            pacman -Sy --noconfirm --needed base-devel pacman-contrib >/dev/null
             useradd -m builder
             chown -R builder:builder /pkg
             runuser -u builder -- updpkgsums
             runuser -u builder -- makepkg --printsrcinfo > /pkg/.SRCINFO
-            runuser -u builder -- makepkg -s --noconfirm
             rm -f /pkg/poc-app-*.tar.gz
             chown -R "$orig_owner" /pkg
           '
-
-      - name: Publish the built package as a poc-aur release
-        # A stable fallback download URL for the callback below,
-        # independent of whether an AUR deploy key is configured.
-        id: github_release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${{ inputs.component }}-v${{ inputs.version }}"
-          # makepkg also builds a separate -debug package by default; the
-          # glob below used to match both and hand gh release create a
-          # single garbled multi-line argument (confirmed for real).
-          pkgfile=$(ls packages/${{ inputs.component }}/*.pkg.tar.zst | grep -v -- -debug-)
-          # Pull this release's actual notes out of multicz's own
-          # per-component CHANGELOG.md - makepkg leaves the extracted
-          # upstream source under src/ after a build. Its directory name
-          # isn't fixed (see the PKGBUILD's build() comment), so glob it.
-          changelog_md=$(ls packages/${{ inputs.component }}/src/*poc-app*/cmd/${{ inputs.component }}/CHANGELOG.md)
-          notes=$(awk -v ver="${{ inputs.version }}" '
-            $0 ~ "^## \\[" ver "\\]" { capture=1; next }
-            capture && /^## \[/ { exit }
-            capture && /^- /    { print }
-          ' "$changelog_md")
-          if [ -z "$notes" ]; then
-            notes="New upstream release: poc-app $tag."
-          fi
-          gh release create "$tag" "$pkgfile" --title "$tag" \
-            --notes "$notes" \
-            --repo "${{ github.repository }}"
-          # `gh`'s own JSON schema names this field "url", not the raw REST
-          # API's "browser_download_url" - confirmed for real: the wrong
-          # name silently resolved to empty rather than erroring.
-          url=$(gh release view "$tag" --repo "${{ github.repository }}" \
-            --json assets -q ".assets[0].url")
-          echo "url=$url" >> "$GITHUB_OUTPUT"
 
       - name: Commit the updated recipe
         # The concurrency group above doesn't reliably serialize two
@@ -171,12 +136,53 @@ jobs:
           git commit -m "${{ inputs.component }}-v${{ inputs.version }}"
           git push origin HEAD:master
 
+      - name: Take the archive of the package
+        # What poc-app attaches to its release. Once pushed, the archive the
+        # AUR itself serves for the package (PKGBUILD and .SRCINFO); its
+        # snapshot can lag a few seconds behind the push. Without the AUR key,
+        # an archive of the same two files, kept in a poc-aur release.
+        id: archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUR_AVAILABLE: ${{ steps.aur.outputs.available }}
+        run: |
+          set -euo pipefail
+          package="poc-${{ inputs.component }}"
+          tag="${{ inputs.component }}-v${{ inputs.version }}"
+          if [ "$AUR_AVAILABLE" = "true" ]; then
+            url="https://aur.archlinux.org/cgit/aur.git/snapshot/${package}.tar.gz"
+            for attempt in 1 2 3 4 5 6; do
+              curl -fsSL -o archive.tar.gz "$url" && break
+              [ "$attempt" -lt 6 ] || { echo "::error::the AUR did not serve $url"; exit 1; }
+              echo "the AUR snapshot is not there yet (attempt $attempt/6)"
+              sleep 10
+            done
+          else
+            mkdir -p "archive/$package"
+            cp "packages/${{ inputs.component }}/PKGBUILD" "packages/${{ inputs.component }}/.SRCINFO" "archive/$package/"
+            tar -czf archive.tar.gz -C archive "$package"
+            asset="${package}-${{ inputs.version }}.tar.gz"
+            cp archive.tar.gz "$asset"
+            if gh release view "$tag" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+              gh release upload "$tag" "$asset" --clobber --repo "${{ github.repository }}"
+            else
+              gh release create "$tag" "$asset" --title "$tag" \
+                --notes "AUR recipe of poc-app $tag: PKGBUILD and .SRCINFO." \
+                --repo "${{ github.repository }}"
+            fi
+            url="https://github.com/${{ github.repository }}/releases/download/${tag}/${asset}"
+          fi
+          sha256=$(sha256sum archive.tar.gz | cut -d' ' -f1)
+          tar -tzf archive.tar.gz
+          echo "archive_url=$url" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$sha256" >> "$GITHUB_OUTPUT"
+
       - name: Report back to poc-app
         # CROSS_REPO_TOKEN is the same fine-grained PAT poc-app uses to
         # trigger this workflow, with Contents (read/write) on poc-app too
-        # so it can fire this repository_dispatch. Links the real AUR page
-        # once pushed there; falls back to this run's poc-aur release
-        # otherwise.
+        # so it can fire this repository_dispatch. Links the AUR page of the
+        # package once pushed there (the archive of the recipe otherwise), and the
+        # archive to attach to the release.
         env:
           GH_TOKEN: ${{ secrets.CROSS_REPO_TOKEN }}
         run: |
@@ -187,7 +193,7 @@ jobs:
           if [ "${{ steps.aur.outputs.available }}" = "true" ]; then
             url="https://aur.archlinux.org/packages/poc-${{ inputs.component }}"
           else
-            url="${{ steps.github_release.outputs.url }}"
+            url="${{ steps.archive.outputs.archive_url }}"
           fi
           gh api repos/goabonga/poc-app/dispatches \
             -f event_type=package-published \
@@ -195,13 +201,17 @@ jobs:
             -f "client_payload[version]=${{ inputs.version }}" \
             -f "client_payload[kind]=aur" \
             -f "client_payload[package]=poc-${{ inputs.component }}" \
-            -f "client_payload[url]=$url"
+            -f "client_payload[url]=$url" \
+            -f "client_payload[archive_url]=${{ steps.archive.outputs.archive_url }}" \
+            -f "client_payload[archive_sha256]=${{ steps.archive.outputs.archive_sha256 }}"
 
       - name: Job summary
         if: ${{ !cancelled() }}
         env:
           JOB_STATUS: ${{ job.status }}
           AUR_AVAILABLE: ${{ steps.aur.outputs.available }}
+          ARCHIVE_URL: ${{ steps.archive.outputs.archive_url }}
+          ARCHIVE_SHA256: ${{ steps.archive.outputs.archive_sha256 }}
         run: |
           {
             echo "## Package publish: ${JOB_STATUS}"
@@ -210,7 +220,10 @@ jobs:
             echo "| --- | --- |"
             echo "| Component | \`${{ inputs.component }}\` |"
             echo "| Version | \`${{ inputs.version }}\` |"
-            echo "| Release | [\`${{ inputs.component }}-v${{ inputs.version }}\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ inputs.component }}-v${{ inputs.version }}) |"
+            echo "| poc-app release | \`${{ inputs.component }}-v${{ inputs.version }}\` |"
+            if [ -n "$ARCHIVE_URL" ]; then
+              echo "| Archive sent to poc-app | [archive](${ARCHIVE_URL}), SHA-256 \`${ARCHIVE_SHA256}\` |"
+            fi
             if [ "$AUR_AVAILABLE" = "true" ]; then
               echo "| AUR | [poc-${{ inputs.component }}](https://aur.archlinux.org/packages/poc-${{ inputs.component }}) |"
             else
