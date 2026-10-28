@@ -195,3 +195,24 @@ jobs:
             -f "client_payload[version]=${{ inputs.version }}" \
             -f "client_payload[kind]=aur" \
             -f "client_payload[url]=$url"
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          AUR_AVAILABLE: ${{ steps.aur.outputs.available }}
+        run: |
+          {
+            echo "## Package publish: ${JOB_STATUS}"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Component | \`${{ inputs.component }}\` |"
+            echo "| Version | \`${{ inputs.version }}\` |"
+            echo "| Release | [\`${{ inputs.component }}-v${{ inputs.version }}\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${{ inputs.component }}-v${{ inputs.version }}) |"
+            if [ "$AUR_AVAILABLE" = "true" ]; then
+              echo "| AUR | [poc-${{ inputs.component }}](https://aur.archlinux.org/packages/poc-${{ inputs.component }}) |"
+            else
+              echo "| AUR | skipped (no AUR_SSH_KEY) |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
