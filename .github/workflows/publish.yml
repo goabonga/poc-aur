@@ -194,6 +194,7 @@ jobs:
             -f "client_payload[component]=${{ inputs.component }}" \
             -f "client_payload[version]=${{ inputs.version }}" \
             -f "client_payload[kind]=aur" \
+            -f "client_payload[package]=poc-${{ inputs.component }}" \
             -f "client_payload[url]=$url"
 
       - name: Job summary
